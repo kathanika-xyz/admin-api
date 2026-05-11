@@ -22,7 +22,19 @@ module.exports = function (app) {
       ordersAnalyticsController.getOrdersStatusSummary
     );
 
+  app
+    .route('/admin/orders/analytics/volume-summary')
+    .get(
+      AuthMiddleware.isAdminUser,
+      ordersAnalyticsValidator.validateOrdersAnalyticsQuery,
+      ordersAnalyticsController.getOrdersVolumeSummary
+    );
+
   app.route('/admin/orders/export').get(AuthMiddleware.isAdminUser, ordersController.exportAdminOrdersCsv);
+
+  app
+    .route('/admin/orders/play-store')
+    .get(AuthMiddleware.isAdminUser, ordersController.listAdminPlayStoreOrders);
 
   app
     .route('/admin/orders/:orderId/google-play/preview-from-console')

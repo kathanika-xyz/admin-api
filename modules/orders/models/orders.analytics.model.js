@@ -143,7 +143,14 @@ function calendarDayInTzFromUtcWallTime(tsVal, tz) {
 }
 
 /**
- * Daily buckets: filter in SQL (UTC range), aggregate by calendar day in `tz` in Node.
+ * Daily buckets for orders analytics.
+ *
+ * **created** — all orders whose `created_at` falls in the UTC window (starters in period).
+ * **completed** — orders with `status = 'completed'` whose **`created_at`** falls in the window
+ *   (cohort: successfully completed among starters — comparable to “created”, not completion-throughput).
+ * **failed** — orders with `status = 'failed'` whose **`created_at`** falls in the window
+ *   (same cohort so rates vs created are meaningful).
+ *
  * @param {string} tz
  * @param {string} rangeStartUtc
  * @param {string} rangeEndUtc
@@ -157,11 +164,11 @@ async function queryDailyByKind(tz, rangeStartUtc, rangeEndUtc, filterPart, kind
     dateFormatCol = "DATE_FORMAT(o.created_at, '%Y-%m-%d %H:%i:%s')";
     whereExtra = 'o.created_at >= ? AND o.created_at <= ?';
   } else if (kind === 'completed') {
-    dateFormatCol = "DATE_FORMAT(o.completed_at, '%Y-%m-%d %H:%i:%s')";
-    whereExtra = `o.status = 'completed' AND o.completed_at IS NOT NULL AND o.completed_at >= ? AND o.completed_at <= ?`;
+    dateFormatCol = "DATE_FORMAT(o.created_at, '%Y-%m-%d %H:%i:%s')";
+    whereExtra = `o.status = 'completed' AND o.created_at >= ? AND o.created_at <= ?`;
   } else {
-    dateFormatCol = "DATE_FORMAT(o.failed_at, '%Y-%m-%d %H:%i:%s')";
-    whereExtra = `o.status = 'failed' AND o.failed_at IS NOT NULL AND o.failed_at >= ? AND o.failed_at <= ?`;
+    dateFormatCol = "DATE_FORMAT(o.created_at, '%Y-%m-%d %H:%i:%s')";
+    whereExtra = `o.status = 'failed' AND o.created_at >= ? AND o.created_at <= ?`;
   }
 
   const query = `
@@ -190,19 +197,16 @@ async function queryDailyByKind(tz, rangeStartUtc, rangeEndUtc, filterPart, kind
 }
 
 /**
- * @param {string} rangeStartUtc
- * @param {string} rangeEndUtc
- * @param {{ sql: string, params: any[] }} filterPart
- * @param {'created'|'completed'|'failed'} kind
+ * Period totals for orders analytics (same cohort semantics as {@link queryDailyByKind}).
  */
 async function queryCountByKind(rangeStartUtc, rangeEndUtc, filterPart, kind) {
   let whereExtra;
   if (kind === 'created') {
     whereExtra = 'o.created_at >= ? AND o.created_at <= ?';
   } else if (kind === 'completed') {
-    whereExtra = `o.status = 'completed' AND o.completed_at IS NOT NULL AND o.completed_at >= ? AND o.completed_at <= ?`;
+    whereExtra = `o.status = 'completed' AND o.created_at >= ? AND o.created_at <= ?`;
   } else {
-    whereExtra = `o.status = 'failed' AND o.failed_at IS NOT NULL AND o.failed_at >= ? AND o.failed_at <= ?`;
+    whereExtra = `o.status = 'failed' AND o.created_at >= ? AND o.created_at <= ?`;
   }
 
   const query = `
@@ -247,7 +251,7 @@ exports.getOrdersStatusDaily = async function (opts) {
 };
 
 /**
- * Summary counts for metric cards (same date semantics and product filter as daily series).
+ * Summary counts for metric cards (cohort: `created_at` in window; completed/failed are subsets of starters).
  * @param {Object} opts
  * @param {string} opts.startCal
  * @param {string} opts.endCal
@@ -283,5 +287,46 @@ exports.getOrdersStatusSummary = async function (opts) {
     failed_count,
     failure_rate_pct,
     completion_rate_pct
+  };
+};
+
+/**
+ * Total orders and distinct users in range (`orders.created_at` in UTC window for calendar days in `tz`).
+ * Single aggregate on MySQL `orders` (spoke / source of truth for admin list + CSV export).
+ *
+ * We intentionally do **not** read ClickHouse `analytics_events_raw` (hub) here: `order_created` event
+ * counts can drift from persisted rows (delivery lag, retries, non-emitting paths), and a narrow
+ * `COUNT(*)` + `COUNT(DISTINCT user_id)` on an indexed `created_at` range is typically faster and
+ * simpler than scanning raw events. Use {@link AnalyticsModel.queryOrdersFunnelClickhouseSummary}
+ * when you need hub-scoped funnel dimensions (app_version, product_classification, etc.).
+ *
+ * `ppIds` must be pre-resolved in the controller (null = no product filter).
+ *
+ * @param {Object} opts
+ * @param {string} opts.startCal YYYY-MM-DD
+ * @param {string} opts.endCal YYYY-MM-DD
+ * @param {string} opts.tz IANA
+ * @param {number[]|null} opts.ppIds payment_plan_id list, or null if not filtering by product bucket
+ * @param {string} [opts.paymentGateway]
+ * @returns {Promise<{ total_orders: number, unique_users: number }>}
+ */
+exports.getOrdersVolumeSummary = async function (opts) {
+  const { startCal, endCal, tz, ppIds, paymentGateway } = opts;
+  const { rangeStartUtc, rangeEndUtc } = utcRangeForCalendarDays(startCal, endCal, tz);
+
+  const planPart = planFilterClause(ppIds);
+  const filterPart = mergeSqlParts(planPart, gatewayFilterClause(paymentGateway));
+
+  const query = `
+    SELECT COUNT(*) AS total_orders, COUNT(DISTINCT user_id) AS unique_users
+    FROM orders o
+    WHERE o.created_at >= ? AND o.created_at <= ?${filterPart.sql}
+  `;
+  const params = [rangeStartUtc, rangeEndUtc, ...filterPart.params];
+  const rows = await MysqlQueryRunner.runQueryInSlave(query, params);
+  const row = rows && rows[0] ? rows[0] : {};
+  return {
+    total_orders: Number(row.total_orders) || 0,
+    unique_users: Number(row.unique_users) || 0
   };
 };

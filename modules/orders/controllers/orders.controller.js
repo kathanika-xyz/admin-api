@@ -1,10 +1,12 @@
 'use strict';
 
 const OrdersModel = require('../models/orders.model');
+const GooglePlayOrphanModel = require('../models/google-play-orphan.model');
 const PaymentPlansModel = require('../../payment-plans/models/payment-plans.model');
 const GenerationsModel = require('../../generations/models/generations.model');
 const orderTemplateStitch = require('../utils/orderTemplateStitch.util');
 const orderLifecycleAnalyticsEnrichment = require('../utils/ordersLifecycleAnalyticsEnrichment.util');
+const GooglePlayOrderSyncService = require('../services/google-play-order-sync.service');
 
 function normPlanField(v) {
   if (v == null || v === '') return '';
@@ -109,6 +111,145 @@ function formatCsvDate(v) {
 }
 
 /**
+ * One row per distinct user_id, sorted by user_id ascending, with a stable row_num (#) for review in Excel.
+ * Built from the same capped order list as the per-order export (newest orders first in DB; aggregation loses that order).
+ */
+function aggregateOrdersByUserForCsv(orders) {
+  /** @type {Map<string, { userKey: string, userRows: object[] }>} */
+  const map = new Map();
+  for (const o of orders) {
+    const uid = o.user_id;
+    const key = uid == null || uid === '' ? '__NO_USER__' : String(uid);
+    let agg = map.get(key);
+    if (!agg) {
+      agg = { userKey: key, userRows: [] };
+      map.set(key, agg);
+    }
+    agg.userRows.push(o);
+  }
+
+  const rows = [];
+  for (const { userKey, userRows } of map.values()) {
+    const orderIds = [
+      ...new Set(userRows.map((r) => r.order_id).filter((id) => id != null && id !== ''))
+    ].sort((a, b) => {
+      const na = Number(a);
+      const nb = Number(b);
+      if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+      return String(a).localeCompare(String(b));
+    });
+
+    const times = userRows
+      .map((r) => r.created_at)
+      .filter(Boolean)
+      .map((d) => {
+        try {
+          return new Date(d).getTime();
+        } catch {
+          return NaN;
+        }
+      })
+      .filter((t) => !Number.isNaN(t))
+      .sort((a, b) => a - b);
+
+    const newestFirst = [...userRows].sort(
+      (a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
+    );
+    const u =
+      newestFirst.find((r) => r.user_details && Object.keys(r.user_details).length)?.user_details ||
+      newestFirst[0]?.user_details ||
+      {};
+
+    rows.push({
+      row_num: 0,
+      user_id: userKey === '__NO_USER__' ? '' : userKey,
+      order_count: orderIds.length,
+      display_name: u.display_name ?? '',
+      email: u.email ?? '',
+      mobile: u.mobile ?? '',
+      first_order_at: times.length ? new Date(times[0]).toISOString() : '',
+      last_order_at: times.length ? new Date(times[times.length - 1]).toISOString() : '',
+      order_ids: orderIds.join('; ')
+    });
+  }
+
+  rows.sort((a, b) => {
+    const ua = a.user_id;
+    const ub = b.user_id;
+    if (!ua && !ub) return 0;
+    if (!ua) return 1;
+    if (!ub) return -1;
+    return ua.localeCompare(ub);
+  });
+  rows.forEach((r, i) => {
+    r.row_num = i + 1;
+  });
+  return rows;
+}
+
+const moment = require('moment');
+const TimezoneService = require('../../analytics/services/timezone.service');
+
+/**
+ * Optional created-at range (client calendar → UTC) or numeric order_id bounds from query string.
+ * When both are present, created-at range wins and order_id bounds are ignored (matches admin UI XOR).
+ * Mutates filterPayload with createdAtFrom, createdAtTo, orderIdFrom, orderIdTo when valid.
+ * @returns {{ status: number, message: string } | null} error response body or null
+ */
+function mergeAdminOrdersRangeFiltersFromQuery(req, filterPayload) {
+  const start_date = req.query.start_date != null ? String(req.query.start_date).trim() : '';
+  const end_date = req.query.end_date != null ? String(req.query.end_date).trim() : '';
+  const tz = req.query.tz != null ? String(req.query.tz).trim() : '';
+
+  let hasCreatedRange = false;
+  if (start_date || end_date) {
+    if (!start_date || !end_date) {
+      return { status: 400, message: 'Both start_date and end_date are required for a date filter.' };
+    }
+    const timezone = tz || TimezoneService.getDefaultTimezone();
+    if (!TimezoneService.isValidTimezone(timezone)) {
+      return { status: 400, message: 'Invalid timezone' };
+    }
+    const utcFilters = TimezoneService.convertToUTC(start_date, end_date, null, null, timezone);
+    const createdAtFrom = moment.utc(`${utcFilters.start_date} ${utcFilters.start_time}`).format('YYYY-MM-DD HH:mm:ss');
+    const createdAtTo = moment.utc(`${utcFilters.end_date} ${utcFilters.end_time}`).format('YYYY-MM-DD HH:mm:ss');
+    if (moment.utc(createdAtFrom).isAfter(moment.utc(createdAtTo))) {
+      return { status: 400, message: 'Start date cannot be after end date.' };
+    }
+    filterPayload.createdAtFrom = createdAtFrom;
+    filterPayload.createdAtTo = createdAtTo;
+    hasCreatedRange = true;
+  }
+
+  function parseOrderIdParam(v) {
+    if (v == null || v === '') return null;
+    const n = parseInt(String(v).trim(), 10);
+    if (!Number.isFinite(n) || n < 1 || n > 2147483647) return null;
+    return n;
+  }
+
+  // Same rule as admin UI: created range XOR order id range (avoid stricter AND if both appear in query).
+  if (!hasCreatedRange) {
+    const orderIdFrom = parseOrderIdParam(req.query.order_id_from);
+    const orderIdTo = parseOrderIdParam(req.query.order_id_to);
+    let orderIdFromFinal = orderIdFrom;
+    let orderIdToFinal = orderIdTo;
+    if (orderIdFrom != null && orderIdTo != null && orderIdFrom > orderIdTo) {
+      orderIdFromFinal = orderIdTo;
+      orderIdToFinal = orderIdFrom;
+    }
+    if (orderIdFromFinal != null) {
+      filterPayload.orderIdFrom = orderIdFromFinal;
+    }
+    if (orderIdToFinal != null) {
+      filterPayload.orderIdTo = orderIdToFinal;
+    }
+  }
+
+  return null;
+}
+
+/**
  * GET /admin/orders — paginated orders for admin (filters + search).
  */
 exports.listAdminOrders = async function (req, res) {
@@ -126,12 +267,59 @@ exports.listAdminOrders = async function (req, res) {
 
     const filterPayload = { status, productType, search, client_platform };
 
+    const rangeErr = mergeAdminOrdersRangeFiltersFromQuery(req, filterPayload);
+    if (rangeErr) {
+      return res.status(rangeErr.status).json({ message: rangeErr.message });
+    }
+
     const preparedFilters = await OrdersModel.prepareAdminOrdersFilters(filterPayload);
 
-    const [total, rows] = await Promise.all([
+    const tzRaw = req.query.tz != null ? String(req.query.tz).trim() : '';
+    const summaryTz =
+      tzRaw && TimezoneService.isValidTimezone(tzRaw)
+        ? tzRaw
+        : TimezoneService.getDefaultTimezone();
+
+    const [total, rows, distinctUsersResult] = await Promise.all([
       OrdersModel.countOrdersAdmin(preparedFilters),
-      OrdersModel.listOrdersAdmin({ ...preparedFilters, limit, offset })
+      OrdersModel.listOrdersAdmin({ ...preparedFilters, limit, offset }),
+      page === 1 ? OrdersModel.countDistinctUsersAdmin(preparedFilters) : Promise.resolve(null)
     ]);
+
+    /** Local calendar days represented on this page (usually 1–5); stats run only for these UTC day windows. */
+    const dayKeySet = new Set();
+    for (const r of rows || []) {
+      const k = OrdersModel.calendarDayKeyFromCreatedAt(r.created_at, summaryTz);
+      if (k) dayKeySet.add(k);
+    }
+    const dayKeys = [...dayKeySet].sort((a, b) => b.localeCompare(a));
+
+    let summary;
+    if (dayKeys.length > 0) {
+      const dayAgg = await OrdersModel.summarizeAdminOrdersForCalendarDays(
+        preparedFilters,
+        summaryTz,
+        dayKeys
+      );
+      if (page === 1) {
+        summary = {
+          unique_users: distinctUsersResult,
+          distinct_calendar_days: dayAgg.distinct_calendar_days,
+          orders_by_calendar_day: dayAgg.orders_by_calendar_day
+        };
+      } else {
+        summary = {
+          orders_by_calendar_day: dayAgg.orders_by_calendar_day,
+          distinct_calendar_days: dayAgg.distinct_calendar_days
+        };
+      }
+    } else if (page === 1) {
+      summary = {
+        unique_users: distinctUsersResult,
+        distinct_calendar_days: 0,
+        orders_by_calendar_day: []
+      };
+    }
 
     const { planById, userById } = await stitchPlansAndUsersForRows(rows);
     const templateNameById = await orderTemplateStitch.buildTemplateNameByIdMap(rows);
@@ -141,14 +329,19 @@ exports.listAdminOrders = async function (req, res) {
       return orderLifecycleAnalyticsEnrichment.applyLifecycleContextToOrderPayload(base, ctxMap);
     });
 
+    const payload = {
+      orders,
+      page,
+      limit,
+      total,
+      has_more: offset + orders.length < total
+    };
+    if (summary) {
+      payload.summary = summary;
+    }
+
     return res.status(200).json({
-      data: {
-        orders,
-        page,
-        limit,
-        total,
-        has_more: offset + orders.length < total
-      }
+      data: payload
     });
   } catch (err) {
     console.error('listAdminOrders error:', err);
@@ -159,7 +352,145 @@ exports.listAdminOrders = async function (req, res) {
 };
 
 /**
+ * GET /admin/orders/play-store — Orphan reconciliation queue (photobop-api writes `google_play_orphan_events`).
+ * For each row: batch `orders.get` first when `play_order_id` exists, then stitch a matching internal order if any (by `pg_order_id` or `pg_payment_id` = purchase token).
+ */
+exports.listAdminPlayStoreOrders = async function (req, res) {
+  try {
+    const limitRaw = parseInt(req.query.limit, 10);
+    const pageRaw = parseInt(req.query.page, 10);
+    const limit = Math.min(Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 20, 100);
+    const page = Math.max(Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1, 1);
+    const offset = (page - 1) * limit;
+
+    const [total, orphanRows] = await Promise.all([
+      GooglePlayOrphanModel.countOrphansAdmin(),
+      GooglePlayOrphanModel.listOrphansAdmin({ limit, offset })
+    ]);
+
+    const pgIds = orphanRows
+      .map((r) => r.play_order_id)
+      .filter((id) => id != null && String(id).trim() !== '')
+      .map((id) => String(id).trim());
+
+    let playMeta = { ordersById: {}, failures: [], skipped: false };
+    try {
+      playMeta = await GooglePlayOrderSyncService.batchGetOrdersByPlayOrderIds(pgIds);
+    } catch (e) {
+      if (e && e.code === 'GOOGLE_NOT_CONFIGURED') {
+        playMeta = { ordersById: {}, failures: [], skipped: true };
+      } else {
+        console.error('listAdminPlayStoreOrders: Play batch lookup failed', e.message || e);
+        playMeta = { ordersById: {}, failures: [], skipped: true };
+      }
+    }
+
+    const matchRows = await OrdersModel.findGooglePlayOrdersMatchingOrphans({
+      pgOrderIds: orphanRows.map((r) => r.play_order_id),
+      purchaseTokens: orphanRows.map((r) => r.purchase_token)
+    });
+
+    const { planById, userById } = await stitchPlansAndUsersForRows(matchRows);
+    const templateNameById = await orderTemplateStitch.buildTemplateNameByIdMap(matchRows);
+    const ctxMap = await orderLifecycleAnalyticsEnrichment.fetchLifecycleContextMapForOrderRows(matchRows);
+
+    const byPg = Object.create(null);
+    const byTok = Object.create(null);
+    for (const r of matchRows) {
+      if (r.pg_order_id != null && String(r.pg_order_id).trim() !== '') {
+        byPg[String(r.pg_order_id).trim()] = r;
+      }
+      if (r.pg_payment_id != null && String(r.pg_payment_id).trim() !== '') {
+        byTok[String(r.pg_payment_id).trim()] = r;
+      }
+    }
+
+    const failureByPg = new Map((playMeta.failures || []).map((f) => [String(f.play_order_id), f]));
+
+    let ordersOut = orphanRows.map((orph) => {
+      const pid = orph.play_order_id != null ? String(orph.play_order_id).trim() : '';
+      const tok = orph.purchase_token != null ? String(orph.purchase_token).trim() : '';
+      const rawOrder = (pid && byPg[pid]) || (tok && byTok[tok]) || null;
+
+      const internal = rawOrder
+        ? orderLifecycleAnalyticsEnrichment.applyLifecycleContextToOrderPayload(
+            mapRowToAdminOrder(rawOrder, planById, userById, templateNameById),
+            ctxMap
+          )
+        : null;
+
+      const ps = pid && playMeta.ordersById[pid] ? playMeta.ordersById[pid] : null;
+      const fail = pid ? failureByPg.get(pid) : null;
+
+      const orphan_meta = {
+        id: orph.id,
+        purchase_token: orph.purchase_token,
+        source: orph.source,
+        reason_code: orph.reason_code,
+        user_id_hint: orph.user_id_hint,
+        requested_internal_order_id: orph.requested_internal_order_id,
+        notification_type: orph.notification_type,
+        product_id: orph.product_id,
+        app_version: orph.app_version,
+        device_os: orph.device_os,
+        device_os_version: orph.device_os_version,
+        device_brand: orph.device_brand,
+        device_model: orph.device_model,
+        first_seen_at: orph.first_seen_at,
+        last_seen_at: orph.last_seen_at,
+        payload_json: orph.payload_json
+      };
+
+      let play_fetch_error = null;
+      if (!ps) {
+        if (fail && fail.message) play_fetch_error = fail.message;
+        else if (!playMeta.skipped) {
+          play_fetch_error = pid ? 'Play order not returned' : 'No Play order id on orphan row';
+        }
+      }
+
+      return {
+        play_store_order: ps,
+        internal_order: internal,
+        play_fetch_error,
+        orphan_meta
+      };
+    });
+
+    ordersOut.sort((a, b) => {
+      const ta =
+        Date.parse(a.play_store_order?.createTime || '') ||
+        Date.parse(a.orphan_meta?.last_seen_at || '') ||
+        0;
+      const tb =
+        Date.parse(b.play_store_order?.createTime || '') ||
+        Date.parse(b.orphan_meta?.last_seen_at || '') ||
+        0;
+      return tb - ta;
+    });
+
+    return res.status(200).json({
+      data: {
+        orders: ordersOut,
+        page,
+        limit,
+        total,
+        has_more: offset + orphanRows.length < total,
+        play_metadata_skipped: playMeta.skipped,
+        list_kind: 'orphan_queue'
+      }
+    });
+  } catch (err) {
+    console.error('listAdminPlayStoreOrders error:', err);
+    return res.status(500).json({
+      message: 'Failed to list Play Store orders'
+    });
+  }
+};
+
+/**
  * GET /admin/orders/export — UTF-8 CSV (opens in Excel) for current filters; capped at MAX_EXPORT_ROWS (newest first).
+ * Query `export_layout=by_user`: one row per user (sorted by user_id), with row_num, order_count, and semicolon-separated order_ids.
  */
 exports.exportAdminOrdersCsv = async function (req, res) {
   try {
@@ -167,8 +498,16 @@ exports.exportAdminOrdersCsv = async function (req, res) {
     const productType = req.query.product_type ? String(req.query.product_type).trim() : '';
     const search = req.query.search ? String(req.query.search).trim() : '';
     const client_platform = req.query.client_platform ? String(req.query.client_platform).trim().toLowerCase() : '';
+    const exportLayoutRaw = req.query.export_layout ? String(req.query.export_layout).trim().toLowerCase() : '';
+    const exportByUser = exportLayoutRaw === 'by_user' || exportLayoutRaw === 'users';
 
     const filterPayload = { status, productType, search, client_platform };
+
+    const rangeErr = mergeAdminOrdersRangeFiltersFromQuery(req, filterPayload);
+    if (rangeErr) {
+      return res.status(rangeErr.status).json({ message: rangeErr.message });
+    }
+
     const preparedFilters = await OrdersModel.prepareAdminOrdersFilters(filterPayload);
 
     const total = await OrdersModel.countOrdersAdmin(preparedFilters);
@@ -187,69 +526,103 @@ exports.exportAdminOrdersCsv = async function (req, res) {
       return orderLifecycleAnalyticsEnrichment.applyLifecycleContextToOrderPayload(base, ctxMap);
     });
 
-    const headers = [
-      'order_id',
-      'user_id',
-      'display_name',
-      'email',
-      'mobile',
-      'status',
-      'amount_paid',
-      'currency',
-      'purchase_category',
-      'plan_name',
-      'plan_heading',
-      'billing_interval',
-      'template_id',
-      'template_name',
-      'client_platform',
-      'payment_gateway',
-      'quantity',
-      'created_at',
-      'completed_at',
-      'failed_at',
-      'refunded_at',
-      'analytics_app_version',
-      'analytics_os_name',
-      'analytics_os_version'
-    ];
+    const lines = [];
+    let filenameBase = 'orders-export';
 
-    const lines = [headers.join(',')];
-    for (const o of orders) {
-      const u = o.user_details || {};
-      lines.push(
-        [
-          csvEscape(o.order_id),
-          csvEscape(o.user_id),
-          csvEscape(u.display_name),
-          csvEscape(u.email),
-          csvEscape(u.mobile),
-          csvEscape(o.status),
-          csvEscape(o.amount_paid),
-          csvEscape(o.currency),
-          csvEscape(o.purchase_category),
-          csvEscape(o.plan_name),
-          csvEscape(o.plan_heading),
-          csvEscape(o.billing_interval),
-          csvEscape(o.template_id),
-          csvEscape(o.template_name),
-          csvEscape(o.client_platform),
-          csvEscape(o.payment_gateway),
-          csvEscape(o.quantity),
-          csvEscape(formatCsvDate(o.created_at)),
-          csvEscape(formatCsvDate(o.completed_at)),
-          csvEscape(formatCsvDate(o.failed_at)),
-          csvEscape(formatCsvDate(o.refunded_at)),
-          csvEscape(o.analytics_app_version),
-          csvEscape(o.analytics_os_name),
-          csvEscape(o.analytics_os_version)
-        ].join(',')
-      );
+    if (exportByUser) {
+      const aggRows = aggregateOrdersByUserForCsv(orders);
+      const headers = [
+        'row_num',
+        'user_id',
+        'order_count',
+        'display_name',
+        'email',
+        'mobile',
+        'first_order_at',
+        'last_order_at',
+        'order_ids'
+      ];
+      lines.push(headers.join(','));
+      for (const r of aggRows) {
+        lines.push(
+          [
+            csvEscape(r.row_num),
+            csvEscape(r.user_id),
+            csvEscape(r.order_count),
+            csvEscape(r.display_name),
+            csvEscape(r.email),
+            csvEscape(r.mobile),
+            csvEscape(r.first_order_at),
+            csvEscape(r.last_order_at),
+            csvEscape(r.order_ids)
+          ].join(',')
+        );
+      }
+      filenameBase = 'orders-by-user';
+    } else {
+      const headers = [
+        'order_id',
+        'user_id',
+        'display_name',
+        'email',
+        'mobile',
+        'status',
+        'amount_paid',
+        'currency',
+        'purchase_category',
+        'plan_name',
+        'plan_heading',
+        'billing_interval',
+        'template_id',
+        'template_name',
+        'client_platform',
+        'payment_gateway',
+        'quantity',
+        'created_at',
+        'completed_at',
+        'failed_at',
+        'refunded_at',
+        'analytics_app_version',
+        'analytics_os_name',
+        'analytics_os_version'
+      ];
+      lines.push(headers.join(','));
+      for (const o of orders) {
+        const u = o.user_details || {};
+        lines.push(
+          [
+            csvEscape(o.order_id),
+            csvEscape(o.user_id),
+            csvEscape(u.display_name),
+            csvEscape(u.email),
+            csvEscape(u.mobile),
+            csvEscape(o.status),
+            csvEscape(o.amount_paid),
+            csvEscape(o.currency),
+            csvEscape(o.purchase_category),
+            csvEscape(o.plan_name),
+            csvEscape(o.plan_heading),
+            csvEscape(o.billing_interval),
+            csvEscape(o.template_id),
+            csvEscape(o.template_name),
+            csvEscape(o.client_platform),
+            csvEscape(o.payment_gateway),
+            csvEscape(o.quantity),
+            csvEscape(formatCsvDate(o.created_at)),
+            csvEscape(formatCsvDate(o.completed_at)),
+            csvEscape(formatCsvDate(o.failed_at)),
+            csvEscape(formatCsvDate(o.refunded_at)),
+            csvEscape(o.analytics_app_version),
+            csvEscape(o.analytics_os_name),
+            csvEscape(o.analytics_os_version)
+          ].join(',')
+        );
+      }
     }
 
     const body = `\uFEFF${lines.join('\r\n')}\r\n`;
     const dayStamp = new Date().toISOString().slice(0, 10);
-    const filename = `orders-export-${dayStamp}.csv`;
+    const filename = `${filenameBase}-${dayStamp}.csv`;
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
