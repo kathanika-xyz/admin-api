@@ -353,3 +353,292 @@ exports.getSubscriptionPurchasesDaily = async function (opts) {
   const daily = await queryDailyByKind(tz, rangeStartUtc, rangeEndUtc, filterPart, 'completed');
   return { daily };
 };
+
+/** SQL expression: order row counts as à la carte (matches {@link getPpIdsForProductFilter} `alacarte`). */
+const ORDER_IS_ALACARTE_SQL = `
+  pp.pp_id IS NOT NULL
+  AND pp.plan_type IN ('single', 'bundle')
+  AND pp.billing_interval IN ('alacarte', 'onetime')
+`;
+
+/** Matches {@link getPpIdsForProductFilter} `addon`. */
+const ORDER_IS_ADDON_SQL = `
+  pp.pp_id IS NOT NULL
+  AND pp.plan_type = 'addon'
+  AND pp.billing_interval = 'onetime'
+`;
+
+/** Matches {@link getPpIdsForProductFilter} `subscription` (completed orders). */
+const ORDER_IS_SUBSCRIPTION_PLAN_SQL = `
+  pp.pp_id IS NOT NULL
+  AND pp.plan_type = 'credits'
+  AND pp.billing_interval IN ('monthly', 'yearly')
+`;
+
+/** Matches {@link getPpIdsForProductFilter} `onetime` credit packs (completed orders). */
+const ORDER_IS_ONETIME_CREDITS_SQL = `
+  pp.pp_id IS NOT NULL
+  AND pp.plan_type = 'credits'
+  AND (pp.billing_interval IS NULL OR pp.billing_interval NOT IN ('monthly', 'yearly'))
+`;
+
+/** Plan upgrade rows — excluded from initial + renewal (matches admin subscription table). */
+const SUBSCRIPTION_IS_UPGRADE_SQL = `
+  JSON_VALID(s.additional_data)
+  AND JSON_UNQUOTE(JSON_EXTRACT(s.additional_data, '$.notes.type')) = 'upgrade'
+`;
+
+/**
+ * Recurring subscription row counted as new (initial) or renewal — not upgrade / one-time.
+ */
+const SUBSCRIPTION_IS_INITIAL_OR_RENEWAL_SQL = `
+  s.payment_type = 'recurring'
+  AND NOT (${SUBSCRIPTION_IS_UPGRADE_SQL})
+`;
+
+/** @type {Record<string, string>} */
+const PURCHASING_CUSTOMERS_SORT_COLUMNS = {
+  last_purchased_at: 'purchasers.last_purchased_at',
+  alacarte_purchases: 'purchasers.alacarte_purchases',
+  subscription_purchases: 'purchasers.subscription_purchases',
+  addon_purchases: 'purchasers.addon_purchases',
+  total_purchases: 'purchasers.total_purchases',
+  credit_balance: 'purchasers.credit_balance'
+};
+
+const PURCHASING_CUSTOMERS_RANGE_COLUMNS = {
+  alacarte_purchases: 'alacarte_purchases',
+  subscription_purchases: 'subscription_purchases',
+  addon_purchases: 'addon_purchases',
+  total_purchases: 'total_purchases',
+  credit_balance: 'credit_balance'
+};
+
+/**
+ * @param {string} [rangeField]
+ * @param {number|null|undefined} rangeMin
+ * @param {number|null|undefined} rangeMax
+ * @returns {{ clause: string, params: number[] }}
+ */
+function buildPurchasingCustomersRangeClause(rangeField, rangeMin, rangeMax) {
+  const key = rangeField != null ? String(rangeField).trim() : '';
+  const col = PURCHASING_CUSTOMERS_RANGE_COLUMNS[key];
+  if (!col) return { clause: '', params: [] };
+
+  const parts = [];
+  const params = [];
+  if (rangeMin != null && Number.isFinite(Number(rangeMin))) {
+    parts.push(`purchasers.${col} >= ?`);
+    params.push(Math.floor(Number(rangeMin)));
+  }
+  if (rangeMax != null && Number.isFinite(Number(rangeMax))) {
+    parts.push(`purchasers.${col} <= ?`);
+    params.push(Math.floor(Number(rangeMax)));
+  }
+  if (!parts.length) return { clause: '', params: [] };
+  return { clause: `AND ${parts.join(' AND ')}`, params };
+}
+
+/**
+ * @param {string} [sortBy]
+ * @param {string} [sortDir]
+ * @returns {string}
+ */
+function resolvePurchasingCustomersOrderBy(sortBy, sortDir) {
+  const key = sortBy != null ? String(sortBy).trim() : '';
+  const col =
+    PURCHASING_CUSTOMERS_SORT_COLUMNS[key] || PURCHASING_CUSTOMERS_SORT_COLUMNS.last_purchased_at;
+  const dir = String(sortDir || '').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  return `${col} ${dir}, purchasers.user_id DESC`;
+}
+
+const PURCHASE_AT_ORDERS_SQL = `COALESCE(o.completed_at, o.created_at)`;
+const PURCHASE_AT_ORDERS_ELIGIBLE_SQL = `COALESCE(completed_at, created_at)`;
+const PURCHASE_AT_SUBSCRIPTIONS_SQL = `COALESCE(s.start_at, s.created_at)`;
+const PURCHASE_AT_SUBSCRIPTIONS_ELIGIBLE_SQL = `COALESCE(start_at, created_at)`;
+
+/**
+ * @param {string} rangeStartUtc
+ * @param {string} rangeEndUtc
+ * @returns {string[]}
+ */
+function purchasingCustomersDateParams(rangeStartUtc, rangeEndUtc) {
+  return [rangeStartUtc, rangeEndUtc];
+}
+
+/**
+ * Paginated customers who have at least one purchase in the calendar date range
+ * (completed order and/or initial/renewal subscription row).
+ *
+ * Purchase counts are computed in SQL (not summed on the client):
+ * - `alacarte_purchases`: completed orders on à la carte plans
+ * - `addon_purchases`: completed orders on add-on plans
+ * - `subscription_purchases`: initial + renewal subscription rows, plus completed credit /
+ *   subscription-plan orders (monthly, yearly, one-time packs)
+ * - `total_purchases`: `alacarte + addon + subscription` (all from SQL)
+ *
+ * @param {Object} opts
+ * @param {string} opts.startCal YYYY-MM-DD
+ * @param {string} opts.endCal YYYY-MM-DD
+ * @param {string} opts.tz IANA timezone for calendar-day bounds
+ * @param {string} [opts.search] name, email, mobile, or user id fragment
+ * @param {number} opts.limit
+ * @param {number} opts.offset
+ * @param {string} [opts.sortBy]
+ * @param {string} [opts.sortDir] asc | desc
+ * @param {string} [opts.rangeField] alacarte_purchases | subscription_purchases | addon_purchases | total_purchases | credit_balance
+ * @param {number} [opts.rangeMin]
+ * @param {number} [opts.rangeMax]
+ * @param {boolean} [opts.useMaster]
+ * @returns {Promise<{ rows: object[], total: number }>}
+ */
+exports.listPurchasingCustomersForAdmin = async function (opts) {
+  const {
+    startCal,
+    endCal,
+    tz,
+    search = '',
+    limit,
+    offset,
+    sortBy,
+    sortDir,
+    rangeField,
+    rangeMin,
+    rangeMax,
+    useMaster = false
+  } = opts;
+  const orderBySql = resolvePurchasingCustomersOrderBy(sortBy, sortDir);
+  const runQuery = useMaster ? MysqlQueryRunner.runQueryInMaster : MysqlQueryRunner.runQueryInSlave;
+  const { rangeStartUtc, rangeEndUtc } = utcRangeForCalendarDays(startCal, endCal, tz);
+  const datePair = purchasingCustomersDateParams(rangeStartUtc, rangeEndUtc);
+
+  const searchTrim = search != null ? String(search).trim() : '';
+  let searchClause = '';
+  const searchParams = [];
+  if (searchTrim) {
+    const term = `%${searchTrim}%`;
+    searchClause = `
+      AND (
+        CAST(u.user_id AS CHAR) LIKE ?
+        OR COALESCE(u.display_name, '') LIKE ?
+        OR COALESCE(u.email, '') LIKE ?
+        OR COALESCE(u.mobile, '') LIKE ?
+        OR TRIM(CONCAT(COALESCE(u.first_name, ''), ' ', COALESCE(u.last_name, ''))) LIKE ?
+      )
+    `;
+    searchParams.push(term, term, term, term, term);
+  }
+
+  const baseFromParams = [
+    ...datePair,
+    ...datePair,
+    ...datePair,
+    ...datePair,
+    ...searchParams
+  ];
+
+  const baseFrom = `
+    FROM user u
+    INNER JOIN (
+      SELECT user_id FROM orders
+      WHERE status = 'completed' AND COALESCE(payment_gateway, '') <> 'admin_grant'
+        AND ${PURCHASE_AT_ORDERS_ELIGIBLE_SQL} >= ? AND ${PURCHASE_AT_ORDERS_ELIGIBLE_SQL} <= ?
+      UNION
+      SELECT user_id FROM subscriptions s
+      WHERE ${SUBSCRIPTION_IS_INITIAL_OR_RENEWAL_SQL}
+        AND ${PURCHASE_AT_SUBSCRIPTIONS_ELIGIBLE_SQL} >= ? AND ${PURCHASE_AT_SUBSCRIPTIONS_ELIGIBLE_SQL} <= ?
+    ) eligible ON eligible.user_id = u.user_id
+    LEFT JOIN (
+      SELECT
+        o.user_id,
+        SUM(CASE WHEN ${ORDER_IS_ALACARTE_SQL} THEN 1 ELSE 0 END) AS alacarte_purchases,
+        SUM(CASE WHEN ${ORDER_IS_ADDON_SQL} THEN 1 ELSE 0 END) AS addon_purchases,
+        SUM(
+          CASE
+            WHEN ${ORDER_IS_SUBSCRIPTION_PLAN_SQL} THEN 1
+            WHEN ${ORDER_IS_ONETIME_CREDITS_SQL} THEN 1
+            WHEN pp.pp_id IS NULL THEN 1
+            ELSE 0
+          END
+        ) AS subscription_order_purchases,
+        MAX(${PURCHASE_AT_ORDERS_SQL}) AS last_order_at
+      FROM orders o
+      LEFT JOIN payment_plans pp ON pp.pp_id = o.payment_plan_id
+      WHERE o.status = 'completed' AND COALESCE(o.payment_gateway, '') <> 'admin_grant'
+        AND ${PURCHASE_AT_ORDERS_SQL} >= ? AND ${PURCHASE_AT_ORDERS_SQL} <= ?
+      GROUP BY o.user_id
+    ) ostats ON ostats.user_id = u.user_id
+    LEFT JOIN (
+      SELECT
+        s.user_id,
+        COUNT(*) AS subscription_purchases,
+        MAX(${PURCHASE_AT_SUBSCRIPTIONS_SQL}) AS last_subscription_at
+      FROM subscriptions s
+      WHERE ${SUBSCRIPTION_IS_INITIAL_OR_RENEWAL_SQL}
+        AND ${PURCHASE_AT_SUBSCRIPTIONS_SQL} >= ? AND ${PURCHASE_AT_SUBSCRIPTIONS_SQL} <= ?
+      GROUP BY s.user_id
+    ) sstats ON sstats.user_id = u.user_id
+    LEFT JOIN user_credits uc ON uc.user_id = u.user_id
+    WHERE (u.DELETED_AT IS NULL)
+    ${searchClause}
+  `;
+
+  const aggSelect = `
+    SELECT
+      u.user_id,
+      COALESCE(
+        NULLIF(TRIM(u.display_name), ''),
+        NULLIF(TRIM(CONCAT(COALESCE(u.first_name, ''), ' ', COALESCE(u.last_name, ''))), ''),
+        NULLIF(TRIM(u.email), ''),
+        CAST(u.user_id AS CHAR)
+      ) AS user_name,
+      u.email AS user_email,
+      u.mobile AS user_mobile,
+      u.display_name AS user_display_name,
+      u.first_name AS user_first_name,
+      u.last_name AS user_last_name,
+      COALESCE(ostats.alacarte_purchases, 0) AS alacarte_purchases,
+      COALESCE(ostats.addon_purchases, 0) AS addon_purchases,
+      COALESCE(sstats.subscription_purchases, 0) + COALESCE(ostats.subscription_order_purchases, 0) AS subscription_purchases,
+      COALESCE(ostats.alacarte_purchases, 0)
+        + COALESCE(ostats.addon_purchases, 0)
+        + COALESCE(sstats.subscription_purchases, 0)
+        + COALESCE(ostats.subscription_order_purchases, 0) AS total_purchases,
+      GREATEST(
+        COALESCE(ostats.last_order_at, '1970-01-01 00:00:00'),
+        COALESCE(sstats.last_subscription_at, '1970-01-01 00:00:00')
+      ) AS last_purchased_at,
+      COALESCE(uc.balance, 0) AS credit_balance,
+      COALESCE(uc.reserved_balance, 0) AS credit_reserved_balance
+    ${baseFrom}
+  `;
+
+  const { clause: rangeClause, params: rangeParams } = buildPurchasingCustomersRangeClause(
+    rangeField,
+    rangeMin,
+    rangeMax
+  );
+
+  const countQuery = `
+    SELECT COUNT(*) AS cnt
+    FROM (
+      ${aggSelect}
+    ) purchasers
+    WHERE purchasers.total_purchases > 0
+    ${rangeClause}
+  `;
+  const countRows = await runQuery(countQuery, [...baseFromParams, ...rangeParams]);
+  const total = Number(countRows[0]?.cnt || 0) || 0;
+
+  const listQuery = `
+    SELECT * FROM (
+      ${aggSelect}
+    ) purchasers
+    WHERE purchasers.total_purchases > 0
+    ${rangeClause}
+    ORDER BY ${orderBySql}
+    LIMIT ? OFFSET ?
+  `;
+  const rows = await runQuery(listQuery, [...baseFromParams, ...rangeParams, limit, offset]);
+  return { rows: rows || [], total };
+};

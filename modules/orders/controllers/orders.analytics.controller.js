@@ -41,61 +41,6 @@ function displaySubscriptionStatus(row) {
   return status || 'unknown';
 }
 
-/** RevenueCat `event.store` values (APP_STORE, PLAY_STORE, …) → client_platform slug. */
-function inferPlatformFromRevenueCatStore(store) {
-  if (store == null || String(store).trim() === '') return null;
-  const s = String(store).trim().toUpperCase();
-  if (s.includes('APP_STORE') || s === 'MAC_APP_STORE') return 'ios';
-  if (s.includes('PLAY_STORE') || s === 'AMAZON') return 'android';
-  if (s === 'STRIPE') return 'web';
-  return null;
-}
-
-function inferPlatformFromAdditionalData(raw) {
-  const data = parseSubscriptionAdditionalData(raw);
-  if (!data || typeof data !== 'object') return null;
-
-  let notes = data.notes;
-  if (typeof notes === 'string') {
-    try {
-      notes = JSON.parse(notes);
-    } catch {
-      notes = null;
-    }
-  }
-
-  const store =
-    (notes && typeof notes === 'object' && notes.store != null ? notes.store : null) ||
-    data.store ||
-    null;
-  return inferPlatformFromRevenueCatStore(store);
-}
-
-function inferPlatformFromGatewayOrProvider(orderGateway, subscriptionProvider) {
-  const gateway = orderGateway && String(orderGateway).trim().toLowerCase();
-  const provider = subscriptionProvider && String(subscriptionProvider).trim().toLowerCase();
-  if (gateway === 'apple_iap' || gateway === 'apple' || provider === 'apple_iap' || provider === 'apple') {
-    return 'ios';
-  }
-  if (gateway === 'google_play' || gateway === 'google' || provider === 'google_play' || provider === 'google') {
-    return 'android';
-  }
-  return null;
-}
-
-function resolveSubscriptionPlatformSlug(row) {
-  const fromSql = row.linked_client_platform && String(row.linked_client_platform).trim().toLowerCase();
-  if (fromSql === 'ios' || fromSql === 'android' || fromSql === 'web') return fromSql;
-
-  const fromRc = inferPlatformFromAdditionalData(row.subscription_additional_data);
-  if (fromRc) return fromRc;
-
-  const fromGateway = inferPlatformFromGatewayOrProvider(row.linked_order_gateway, row.subscription_provider);
-  if (fromGateway) return fromGateway;
-
-  return null;
-}
-
 function formatPlatformLabel(clientPlatform) {
   const p = clientPlatform && String(clientPlatform).trim().toLowerCase();
   if (p === 'ios') return 'iOS';
@@ -210,7 +155,7 @@ function buildSubscriptionRowDtos(rawRows, planMap = new Map(), balanceMap = new
       subscription_event_type: labelForSubscriptionEventTypeKey(subscriptionEventTypeKey),
       purchase_or_start_at: formatIsoDate(r.purchase_or_start_at),
       next_recurring_or_renewal_at: formatIsoDate(r.current_period_end || r.renews_at || r.end_at),
-      payment_platform: formatPlatformLabel(resolveSubscriptionPlatformSlug(r)),
+      payment_platform: formatPlatformLabel(r.linked_client_platform),
       payment_gateway: formatGatewayLabel(r.linked_order_gateway, r.subscription_provider),
       subscription_status: displaySubscriptionStatus(r),
       plan_credits: credits,
@@ -434,5 +379,101 @@ exports.getUserSubscriptionsTable = async function (req, res) {
     return res
       .status(HTTP_STATUS_CODES.INTERNAL_SERVER_ERROR)
       .json({ message: 'Failed to load subscription table' });
+  }
+};
+
+function buildPurchasingCustomerUserDetails(row) {
+  const details = {};
+  if (row.user_display_name != null && String(row.user_display_name).trim()) {
+    details.display_name = String(row.user_display_name).trim();
+  }
+  if (row.user_first_name != null && String(row.user_first_name).trim()) {
+    details.first_name = String(row.user_first_name).trim();
+  }
+  if (row.user_last_name != null && String(row.user_last_name).trim()) {
+    details.last_name = String(row.user_last_name).trim();
+  }
+  if (row.user_email != null && String(row.user_email).trim()) {
+    details.email = String(row.user_email).trim();
+  }
+  if (row.user_mobile != null && String(row.user_mobile).trim()) {
+    details.mobile = String(row.user_mobile).trim();
+  }
+  return Object.keys(details).length ? details : null;
+}
+
+/** GET /admin/orders/analytics/purchasing-customers — purchasers in date range (paginated). */
+exports.getPurchasingCustomersTable = async function (req, res) {
+  try {
+    const q = req.validatedQuery;
+    const tzRaw = q.tz && String(q.tz).trim() ? String(q.tz).trim() : TimezoneService.getDefaultTimezone();
+    const tz = normalizeMysqlTimezone(tzRaw);
+    if (!TimezoneService.isValidTimezone(tzRaw)) {
+      return res.status(HTTP_STATUS_CODES.BAD_REQUEST).json({ message: 'Invalid timezone' });
+    }
+
+    const startCal = toCalendarDate(q.start_date);
+    const endCal = toCalendarDate(q.end_date);
+    const page = Math.max(1, Number(q.page) || 1);
+    const limit = Math.min(100, Math.max(1, Number(q.limit) || 10));
+    const offset = (page - 1) * limit;
+    const search = q.search != null ? String(q.search).trim() : '';
+
+    const sortBy = q.sort != null ? String(q.sort).trim() : 'last_purchased_at';
+    const sortDir = q.sort_dir != null ? String(q.sort_dir).trim().toLowerCase() : 'desc';
+    const rangeField =
+      q.range_field != null && String(q.range_field).trim() !== ''
+        ? String(q.range_field).trim()
+        : '';
+    const rangeMin =
+      q.range_min != null && q.range_min !== '' && Number.isFinite(Number(q.range_min))
+        ? Math.floor(Number(q.range_min))
+        : null;
+    const rangeMax =
+      q.range_max != null && q.range_max !== '' && Number.isFinite(Number(q.range_max))
+        ? Math.floor(Number(q.range_max))
+        : null;
+
+    const { rows, total } = await OrdersAnalyticsModel.listPurchasingCustomersForAdmin({
+      startCal,
+      endCal,
+      tz,
+      search,
+      limit,
+      offset,
+      sortBy,
+      sortDir,
+      rangeField: rangeField || undefined,
+      rangeMin,
+      rangeMax,
+      useMaster: true
+    });
+
+    const items = (rows || []).map((row) => ({
+      user_id: row.user_id,
+      user_name: row.user_name != null ? String(row.user_name) : null,
+      user_details: buildPurchasingCustomerUserDetails(row),
+      last_purchased_at: formatIsoDate(row.last_purchased_at),
+      alacarte_purchases: Number(row.alacarte_purchases) || 0,
+      addon_purchases: Number(row.addon_purchases) || 0,
+      subscription_purchases: Number(row.subscription_purchases) || 0,
+      total_purchases: Number(row.total_purchases) || 0,
+      credit_balance: Number(row.credit_balance) || 0,
+      credit_reserved_balance: Number(row.credit_reserved_balance) || 0
+    }));
+
+    return res.status(HTTP_STATUS_CODES.OK).json({
+      data: {
+        items,
+        total,
+        page,
+        limit
+      }
+    });
+  } catch (err) {
+    console.error('getPurchasingCustomersTable error:', err);
+    return res
+      .status(HTTP_STATUS_CODES.INTERNAL_SERVER_ERROR)
+      .json({ message: 'Failed to load purchasing customers' });
   }
 };
