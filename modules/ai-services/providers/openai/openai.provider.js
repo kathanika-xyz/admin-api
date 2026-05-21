@@ -2,6 +2,10 @@
 
 const BaseLLMProvider = require('../base.llm.provider');
 const OpenAIWrapper = require('./openai.wrapper.cjs');
+const {
+  buildOpenaiTokenLimitParams,
+  buildOpenaiTemperatureParam,
+} = require('../../utils/openai.token-limit');
 const { handleOpenAIErrors } = require('../../../core/controllers/openai.errorhandler');
 const { getActiveModelData } = require('../../controllers/active.model.selection.js');
 const nlp = require('compromise');
@@ -44,7 +48,7 @@ class OpenAIProvider extends BaseLLMProvider {
         model: activeModel.name,
         messages,
         response_format: responseFormat ? zodResponseFormat() : undefined,
-        max_tokens: activeModel.maxTokens
+        ...buildOpenaiTokenLimitParams(activeModel.name, activeModel.maxTokens),
       });
 
       const metrics = this._calculateMetrics(response, startTime, messages, activeModel);
@@ -87,7 +91,7 @@ class OpenAIProvider extends BaseLLMProvider {
         model: activeModel.name,
         messages: content,
         response_format: responseFormat ? zodResponseFormat() : undefined,
-        max_tokens: activeModel.maxTokens
+        ...buildOpenaiTokenLimitParams(activeModel.name, activeModel.maxTokens),
       });
 
       const metrics = this._calculateMetrics(response, startTime, messages, activeModel, true);
@@ -366,6 +370,113 @@ console.log({
         success: false,
         error: handleOpenAIErrors(error)
       };
+    }
+  }
+
+  listSupportedModels() {
+    const modelsRegistry = require('../../../admin-llm-chat/services/models.registry.service');
+    return modelsRegistry.getEnabledModels().filter((m) => m.provider === 'openai');
+  }
+
+  async countTokens({ model, messages }) {
+    if (!this.client) await this.initialize();
+    const { encoding_for_model } = require('tiktoken');
+    let enc;
+    try {
+      enc = encoding_for_model(model.startsWith('gpt-4') ? 'gpt-4o' : 'gpt-4o');
+    } catch (_e) {
+      enc = encoding_for_model('gpt-4o');
+    }
+    let total = 0;
+    messages.forEach((m) => {
+      const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
+      total += enc.encode(text).length;
+    });
+    enc.free();
+    return total;
+  }
+
+  async streamChatCompletion({
+    model,
+    messages,
+    tools,
+    maxTokens,
+    temperature,
+    onDelta,
+    onToolCallStart,
+    onToolCallDelta,
+    onToolCallEnd,
+    onFinish,
+    onError,
+    signal,
+  }) {
+    const startTime = performance.now();
+    if (!this.client) await this.initialize();
+
+    const toolCallsMap = {};
+
+    try {
+      const stream = await this.client.chat.completions.create({
+        model,
+        messages,
+        tools: tools && tools.length ? tools : undefined,
+        tool_choice: tools && tools.length ? 'auto' : undefined,
+        ...buildOpenaiTokenLimitParams(model, maxTokens),
+        ...buildOpenaiTemperatureParam(model, temperature),
+        stream: true,
+        stream_options: { include_usage: true },
+      }, { signal });
+
+      let usage = { prompt_tokens: 0, completion_tokens: 0 };
+
+      for await (const chunk of stream) {
+        if (chunk.usage) {
+          usage = chunk.usage;
+        }
+        const choice = chunk.choices?.[0];
+        if (!choice) continue;
+        const delta = choice.delta;
+        if (delta?.content) {
+          onDelta?.({ type: 'token', text: delta.content });
+        }
+        if (delta?.tool_calls) {
+          delta.tool_calls.forEach((tc) => {
+            const idx = tc.index ?? 0;
+            if (!toolCallsMap[idx]) {
+              toolCallsMap[idx] = { id: tc.id, name: tc.function?.name || '', arguments: '' };
+              onToolCallStart?.({ id: toolCallsMap[idx].id, name: toolCallsMap[idx].name, arguments: {} });
+            }
+            if (tc.id) toolCallsMap[idx].id = tc.id;
+            if (tc.function?.name) toolCallsMap[idx].name = tc.function.name;
+            if (tc.function?.arguments) {
+              toolCallsMap[idx].arguments += tc.function.arguments;
+              onToolCallDelta?.({ id: toolCallsMap[idx].id, argumentsDelta: tc.function.arguments });
+            }
+          });
+        }
+        if (choice.finish_reason === 'tool_calls') {
+          Object.values(toolCallsMap).forEach((tc) => {
+            let args = {};
+            try {
+              args = tc.arguments ? JSON.parse(tc.arguments) : {};
+            } catch (_e) {
+              args = {};
+            }
+            onToolCallEnd?.({ id: tc.id, name: tc.name, arguments: args });
+          });
+        }
+      }
+
+      onFinish?.({
+        finishReason: 'stop',
+        usage: {
+          tokensIn: usage.prompt_tokens || 0,
+          tokensOut: usage.completion_tokens || 0,
+        },
+        latencyMs: Math.round(performance.now() - startTime),
+      });
+    } catch (error) {
+      onError?.(error);
     }
   }
 }

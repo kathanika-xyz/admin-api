@@ -1,0 +1,79 @@
+{
+  "defaultModel": {
+    "provider": "openai",
+    "modelId": "gpt-5.5"
+  },
+  "summarizer": {
+    "provider": "openai",
+    "modelId": "gpt-4o-mini"
+  },
+  "providerDefaults": {
+    "anthropic": {
+      "contextWindow": 1000000,
+      "maxOutputTokens": 128000,
+      "supportsVision": true,
+      "supportsTools": true,
+      "inputCostPer1M": 3,
+      "outputCostPer1M": 15,
+      "cacheReadPer1M": 0.3,
+      "cacheWritePer1M": 3.75
+    },
+    "openai": {
+      "contextWindow": 128000,
+      "maxOutputTokens": 16384,
+      "supportsVision": true,
+      "supportsTools": true,
+      "inputCostPer1M": 2.5,
+      "outputCostPer1M": 10
+    }
+  },
+  "models": [
+    {
+      "id": "claude-opus-4-7",
+      "provider": "anthropic",
+      "displayName": "Claude Opus 4.7",
+      "inputCostPer1M": 5,
+      "outputCostPer1M": 25
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "provider": "anthropic",
+      "displayName": "Claude Sonnet 4.6",
+      "maxOutputTokens": 64000,
+      "inputCostPer1M": 3,
+      "outputCostPer1M": 15
+    },
+    {
+      "id": "gpt-5.5",
+      "provider": "openai",
+      "displayName": "GPT-5.5",
+      "contextWindow": 1050000,
+      "maxOutputTokens": 128000,
+      "inputCostPer1M": 5,
+      "outputCostPer1M": 30
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "provider": "anthropic",
+      "displayName": "Claude Haiku 4.5",
+      "contextWindow": 200000,
+      "maxOutputTokens": 64000,
+      "inputCostPer1M": 1,
+      "outputCostPer1M": 5,
+      "cacheReadPer1M": 0.1,
+      "cacheWritePer1M": 1.25
+    },
+    {
+      "id": "gpt-4o",
+      "provider": "openai",
+      "displayName": "GPT-4o"
+    },
+    {
+      "id": "gpt-4o-mini",
+      "provider": "openai",
+      "displayName": "GPT-4o Mini",
+      "inputCostPer1M": 0.15,
+      "outputCostPer1M": 0.6
+    }
+  ]
+}
